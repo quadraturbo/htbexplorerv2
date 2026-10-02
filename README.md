@@ -319,8 +319,6 @@ https://github.com/s4vitar/htbExplorer
 
 ### Autor de esta adaptación
 
-Esta sección puede completarse con tu nombre, alias y repositorio/perfil de GitHub:
-
 ```text
-Adaptación API v4: TU_NOMBRE / @TU_USUARIO
+Adaptación API v4: @quadraturbo
 ```
