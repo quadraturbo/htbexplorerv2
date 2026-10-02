@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+
+# htbExplorer v2 - cliente de terminal para HackTheBox Labs (API v4)
+# Autor original: Marcelo Vázquez (aka S4vitar)
+# Port a labs.hackthebox.com/api/v4: Bearer App Token, sin html2text, sin python, sin root.
+#
+# Token: App Token de https://app.hackthebox.com/profile/settings  (sección "App Tokens")
+#   export HTB_TOKEN="eyJ0..."   |   ~/.config/htbExplorer/token   |   variable API_TOKEN de abajo
+
+#Colours
+declare -r greenColour="\e[0;32m\033[1m"
+declare -r endColour="\033[0m\e[0m"
+declare -r redColour="\e[0;31m\033[1m"
+declare -r blueColour="\e[0;34m\033[1m"
+declare -r yellowColour="\e[0;33m\033[1m"
+declare -r purpleColour="\e[0;35m\033[1m"
+declare -r turquoiseColour="\e[0;36m\033[1m"
+declare -r grayColour="\e[0;37m\033[1m"
+
+# Global Variables
+declare -r API_URL="${HTB_API_URL:-https://labs.hackthebox.com/api/v4}"
+declare -r USER_AGENT="Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+declare -r TOKEN_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/htbExplorer/token"
+API_TOKEN="${HTB_TOKEN:-}"   # <- o pega aquí tu App Token
+
+TMP="$(mktemp -d)"; RESP="$TMP/resp"; HTTP_CODE=0; MID=""; MNAME=""
+
+cleanup(){ rm -rf "$TMP" 2>/dev/null; tput cnorm 2>/dev/null; }
+trap cleanup EXIT
+trap 'echo -e "\n\n${redColour}[!] Exiting...${endColour}"; exit 130' INT
+
+die(){  echo -e "\n${redColour}[!] $*${endColour}\n" >&2; exit 1; }
+ok(){   echo -e "\n${greenColour}[+]${endColour}${grayColour} $*${endColour}\n"; }
+info(){ echo -e "\n${yellowColour}[*]${endColour}${grayColour} $*${endColour}\n"; }
+
+function banner(){
+    echo -e "${greenColour}
+                      .
+                   %%%%%%%.
+               %%%%%%.  %%%%%%.
+          %%%%%%           *%%%%%%.
+       %%%%%                   .%%%%%%
+       %%%%%%%%               %%%%%%%%
+       %%   %%%%%%%      .%%%%%%%  %%%
+       %%       #%%%%%%%%%%%#      %%%    ${endColour}${grayColour}htbExplorer v2 - HackTheBox Terminal Client${endColour}${greenColour}
+       %%           %%%%#          %%%    ${endColour}${blueColour}\t\t\t        by S4vitar${endColour}${redColour} <3${endColour}${greenColour}
+       %%            %%%           %%%
+       %%            %%%           %%%
+       %%%%%         %%%          %%%%
+         %%%%%%%     %%%     %%%%%%.
+             #%%%%%%%%%%%%%%%%%
+                  %%%%%%%%#
+                      .${endColour}\n"
+
+    for i in $(seq 1 80); do echo -ne "${redColour}-"; done; echo -ne "${endColour}"
+}
+
+# ---------- helpers ----------
+
+# Tabla con bordes. stdin = TSV, 1ª línea = cabecera
+function printTable(){
+    awk -F'\t' '
+    { rows[NR]=$0; n=split($0,f,"\t"); if(n>nc)nc=n; for(i=1;i<=n;i++){ l=length(f[i]); if(l>w[i])w[i]=l } }
+    END{
+        if(NR==0) exit
+        sep="+"; for(i=1;i<=nc;i++){ s=""; for(j=0;j<w[i]+2;j++) s=s"-"; sep=sep s "+" }
+        print sep
+        for(r=1;r<=NR;r++){
+            n=split(rows[r],f,"\t"); line="|"
+            for(i=1;i<=nc;i++) line=line sprintf(" %-*s |", w[i], f[i])
+            print line
+            if(r==1) print sep
+        }
+        print sep
+    }'
+}
+
+function urlenc(){ jq -rn --arg s "$1" '$s|@uri'; }
+
+# api METHOD PATH [JSON]  -> cuerpo en $RESP, status en $HTTP_CODE (llamar SIN $(...))
+function api(){
+    local method=$1 path=$2 data=${3:-}
+    local args=(-sS -o "$RESP" -w '%{http_code}' -X "$method"
+                -H "Authorization: Bearer $API_TOKEN" -H "Accept: application/json" -H "User-Agent: $USER_AGENT")
+    [[ -n $data ]] && args+=(-H "Content-Type: application/json" -d "$data")
+    HTTP_CODE=$(curl "${args[@]}" "$API_URL$path" 2>"$TMP/err") || die "curl: $(cat "$TMP/err")"
+}
+
+function apiMsg(){ jq -r '.message // .error // empty' "$RESP" 2>/dev/null; }
+
+# 0 si 2xx; aborta en errores globales; 1 en el resto (el caller decide)
+function checkHTTP(){
+    case $HTTP_CODE in
+        2??) return 0;;
+        401) die "401: token inválido o caducado. Genera un App Token nuevo en app.hackthebox.com/profile/settings";;
+        403) die "403: acceso denegado (permisos o WAF/Cloudflare). $(apiMsg)";;
+        429) die "429: rate limit. Espera unos segundos y reintenta.";;
+    esac
+    return 1
+}
+
+function resolveMachine(){
+    api GET "/machine/profile/$(urlenc "$1")"
+    if ! checkHTTP; then
+        [[ $HTTP_CODE == 404 ]] && die "No existe ninguna máquina llamada '$1'"
+        die "HTTP $HTTP_CODE resolviendo '$1': $(apiMsg)"
+    fi
+    MID=$(jq -r '.info.id // empty' "$RESP"); MNAME=$(jq -r '.info.name // empty' "$RESP")
+    [[ -n $MID ]] || die "Respuesta inesperada de /machine/profile/$1"
+}
+
+# ---------- listado de máquinas ----------
+
+JQ_DEFS='def osk: (.os // "" | ascii_downcase);
+def owned: [ (if .authUserInUserOwns then "user" else empty end), (if .authUserInRootOwns then "root" else empty end) ] | join("+") | if . == "" then "-" else . end;'
+JQ_ROW='[ .name, (.os // "-"), (.difficultyText // "-"), (.points // "-"), (.stars // "-"), (.user_owns_count // "-"), (.root_owns_count // "-"), .retired, ((.release // "-") | tostring | .[0:10]), (if .free then "Yes" else "No" end), owned, .id ] | map(tostring) | @tsv'
+OS_OTHER='(osk as $o | ["linux","windows","freebsd","openbsd"] | index($o)) == null'
+MACHINES_HEADER=$'Name\tOS\tDifficulty\tPoints\tRating\tUser Owns\tRoot Owns\tRetired\tRelease\tFree\tOwned\tID'
+
+# fetchSet active|retired -> $TMP/<set>.json (array con campo extra "retired")
+function fetchSet(){
+    local ep label page=1 last out="$TMP/$1.json"
+    if [[ $1 == active ]]; then ep="/machine/paginated"; label="No"; else ep="/machine/list/retired/paginated"; label="Yes"; fi
+    echo '[]' > "$out"
+    while :; do
+        api GET "$ep?per_page=100&page=$page"
+        checkHTTP || die "HTTP $HTTP_CODE en $ep: $(apiMsg)"
+        jq -e '.data | type == "array"' "$RESP" >/dev/null 2>&1 || die "Respuesta inesperada de $ep (¿cambió la API?)"
+        jq -s --arg r "$label" '.[0] + (.[1].data | map(. + {retired:$r}))' "$out" "$RESP" > "$out.n" && mv "$out.n" "$out"
+        last=$(jq -r '.meta.last_page // 1' "$RESP")
+        (( page >= last )) && break
+        ((page++))
+    done
+}
+
+# machinesTable "<filtro jq>" set...
+function machinesTable(){
+    local filt=$1; shift
+    local s files=()
+    for s in "$@"; do fetchSet "$s"; files+=("$TMP/$s.json"); done
+    jq -s 'add' "${files[@]}" > "$TMP/all.json"
+    local rows
+    rows=$(jq -r "$JQ_DEFS map(select($filt)) | .[] | $JQ_ROW" "$TMP/all.json")
+    if [[ -z $rows ]]; then echo -e "\n${redColour}[!] Sin resultados${endColour}\n"; return 1; fi
+    echo -ne "${greenColour}"
+    { echo "$MACHINES_HEADER"; echo "$rows"; } | printTable
+    echo -e "${endColour}"
+}
+
+function exploreMode(){
+    local mode=$1 scope os filt='true' own='(.authUserInUserOwns == true or .authUserInRootOwns == true)'
+    case $mode in
+        all_machines)           machinesTable "$filt" active retired;;
+        active_machines)        machinesTable "$filt" active;;
+        retired_machines)       machinesTable "$filt" retired;;
+        owned_machines)         machinesTable "$own" active retired;;
+        owned_active_machines)  machinesTable "$own" active;;
+        spawned_machines)       spawnedMachines;;
+        active_*_machines|retired_*_machines)
+            scope=${mode%%_*}; os=${mode#*_}; os=${os%_machines}
+            case $os in
+                linux|windows|freebsd|openbsd) filt="osk == \"$os\"";;
+                other) filt="$OS_OTHER";;
+                *) helpPanel;;
+            esac
+            machinesTable "$filt" "$scope";;
+        *) helpPanel;;
+    esac
+}
+
+function spawnedMachines(){
+    api GET /machine/active; checkHTTP || die "HTTP $HTTP_CODE: $(apiMsg)"
+    if [[ -z $(jq -r '.info.id // empty' "$RESP") ]]; then
+        echo -e "\n${redColour}[!] No tienes ninguna máquina activa${endColour}\n"; return 1
+    fi
+    echo -ne "${greenColour}"
+    { printf 'Name\tID\tIP\tType\tExpires\tSpawning\n'
+      jq -r '.info | [(.name//"-"),(.id//"-"),(.ip//"-"),(.type//"-"),(.expires_at//"-"),((.isSpawning//false)|tostring)] | map(tostring) | @tsv' "$RESP"; } | printTable
+    echo -e "${endColour}"
+}
+
+function searchMachineName(){
+    export KW="$1"
+    machinesTable '(.name // "" | ascii_downcase | contains(($ENV.KW) | ascii_downcase))' active retired \
+        || exit 1
+}
+
+# La API v4 solo expone la IP de la máquina que tienes activa
+function searchIPAddress(){
+    api GET /machine/active; checkHTTP || die "HTTP $HTTP_CODE: $(apiMsg)"
+    if [[ "$(jq -r '.info.ip // empty' "$RESP")" == "$1" ]]; then spawnedMachines
+    else die "Esa IP no corresponde a tu máquina activa (la API v4 no expone IPs de máquinas no spawneadas)"; fi
+}
+
+# ---------- usuarios ----------
+
+function searchUserName(){
+    local uid
+    api GET "/search/fetch?query=$(urlenc "$1")"; checkHTTP || die "HTTP $HTTP_CODE: $(apiMsg)"
+    uid=$(jq -r --arg u "$1" '(.users // []) as $l | ([$l[] | select(((.value // .name // "") | ascii_downcase) == ($u | ascii_downcase))] + $l) | .[0].id // empty' "$RESP")
+    [[ -n $uid ]] || die "No existe ningún usuario que coincida con '$1'"
+    api GET "/user/profile/basic/$uid"; checkHTTP || die "HTTP $HTTP_CODE: $(apiMsg)"
+    echo -ne "${yellowColour}"
+    { printf 'Username\tID\tRank\tRanking\tPoints\tUser Owns\tSystem Owns\tRespects\tCountry\n'
+      jq -r '.profile | [(.name//"-"),(.id//"-"),(.rank//"-"),(.ranking//"-"),(.points//"-"),(.user_owns//"-"),(.system_owns//"-"),(.respects//"-"),(.country_name//"-")] | map(tostring) | @tsv' "$RESP"; } | printTable
+    echo -e "${endColour}"
+}
+
+# ---------- acciones sobre máquinas ----------
+
+function machineAction(){ # spawn|terminate|reset|extend NAME
+    resolveMachine "$2"
+    api POST "/vm/$1" "{\"machine_id\":$MID}"
+    if checkHTTP; then ok "$MNAME: $(apiMsg)"
+    else die "$1 falló (HTTP $HTTP_CODE): $(apiMsg)"; fi
+}
+
+function sendFlags(){
+    [[ $1 == *=* ]] || helpPanel
+    local name=${1%%=*} flag=${1#*=}
+    resolveMachine "$name"
+    api POST /machine/own "$(jq -nc --arg f "$flag" --argjson id "$MID" '{flag:$f,id:$id}')"
+    if checkHTTP; then echo -e "${greenColour}[+] $MNAME: $(apiMsg)${endColour}"
+    else echo -e "${redColour}[!] $MNAME: $(apiMsg) (HTTP $HTTP_CODE)${endColour}"; exit 1; fi
+}
+
+# ---------- VPN ----------
+
+function downloadVPN(){
+    local out=$1 id=${HTB_VPN_ID:-} tcp=${HTB_VPN_TCP:-0}
+    if [[ -z $id ]]; then
+        api GET "/connections/servers?product=labs"; checkHTTP || die "HTTP $HTTP_CODE: $(apiMsg)"
+        id=$(jq -r '.data.assigned.id // empty' "$RESP")
+        if [[ -z $id ]]; then
+            echo -e "\n${yellowColour}[*] Servidores disponibles (ID, nombre):${endColour}"
+            jq -r '[.. | objects | select(has("friendly_name") and has("id"))] | unique_by(.id) | .[] | "\(.id)\t\(.friendly_name)"' "$RESP"
+            die "No tienes servidor asignado. Exporta HTB_VPN_ID=<id> (y HTB_VPN_TCP=1 si quieres TCP)"
+        fi
+    fi
+    api GET "/access/ovpnfile/$id/$tcp"; checkHTTP || die "HTTP $HTTP_CODE descargando VPN: $(apiMsg)"
+    grep -q '^remote ' "$RESP" || die "La respuesta no parece un .ovpn válido"
+    mv "$RESP" "$out" && chmod 600 "$out"
+    ok "VPN guardada en $out (servidor $id, $([[ $tcp == 1 ]] && echo tcp || echo udp))"
+}
+
+# ---------- ayuda ----------
+
+function helpPanel(){
+    banner
+    echo -e "\n${redColour}[!] Usage: ./htbExplorer${endColour}"
+    for i in $(seq 1 80); do echo -ne "${redColour}-"; done; echo -ne "${endColour}"
+    echo -e "\n\n\t${grayColour}[-e]${endColour}${yellowColour} Exploration Mode${endColour}"
+    echo -e "\t\t${purpleColour}all_machines${endColour}${yellowColour}:\t\t\t List all machines${endColour}"
+    echo -e "\t\t${purpleColour}active_machines${endColour}${yellowColour}:\t\t List active machines${endColour}"
+    echo -e "\t\t${purpleColour}retired_machines${endColour}${yellowColour}:\t\t List retired machines${endColour}"
+    echo -e "\t\t${purpleColour}active_{linux,windows,freebsd,openbsd,other}_machines${endColour}${yellowColour}  Active by OS${endColour}"
+    echo -e "\t\t${purpleColour}retired_{linux,windows,freebsd,openbsd,other}_machines${endColour}${yellowColour} Retired by OS${endColour}"
+    echo -e "\t\t${purpleColour}spawned_machines${endColour}${yellowColour}:\t\t Your currently active machine${endColour}"
+    echo -e "\t\t${purpleColour}owned_machines${endColour}${yellowColour}:\t\t\t Machines you own${endColour}"
+    echo -e "\t\t${purpleColour}owned_active_machines${endColour}${yellowColour}:\t\t Active machines you own${endColour}\n"
+    echo -e "\t${grayColour}[-s]${endColour}${yellowColour} Search by machine name${endColour} ${blueColour}\t\t (Example: -s Rope)${endColour}\n"
+    echo -e "\t${grayColour}[-i]${endColour}${yellowColour} Match your active machine's IP${endColour} ${blueColour}\t (Example: -i 10.10.11.10)${endColour}\n"
+    echo -e "\t${grayColour}[-d]${endColour}${yellowColour} Spawn a machine${endColour} ${blueColour}\t\t\t (Example: -d Aragog)${endColour}\n"
+    echo -e "\t${grayColour}[-k]${endColour}${yellowColour} Terminate a machine${endColour} ${blueColour}\t\t (Example: -k Hawk)${endColour}\n"
+    echo -e "\t${grayColour}[-r]${endColour}${yellowColour} Reset a machine${endColour} ${blueColour}\t\t\t (Example: -r Mantis)${endColour}\n"
+    echo -e "\t${grayColour}[-x]${endColour}${yellowColour} Extend a machine time${endColour} ${blueColour}\t\t (Example: -x Legacy)${endColour}\n"
+    echo -e "\t${grayColour}[-f]${endColour}${yellowColour} Send a flag${endColour} ${blueColour}\t\t\t (Example: -f Bucket=flag123)${endColour}\n"
+    echo -e "\t${grayColour}[-u]${endColour}${yellowColour} Search username${endColour} ${blueColour}\t\t\t (Example: -u s4vitar)${endColour}\n"
+    echo -e "\t${grayColour}[-v]${endColour}${yellowColour} Download VPN${endColour}${blueColour}\t\t\t (Example: -v s4vitar.ovpn)${endColour}"
+    echo -e "\t    ${blueColour}Servidor: el asignado en tu cuenta, o HTB_VPN_ID=<id> [HTB_VPN_TCP=1]${endColour}\n"
+    echo -e "\t${grayColour}Removed in v2:${endColour} ${redColour}-a${endColour} (assign), ${redColour}-c/-w${endColour} (shoutbox): ya no existen en la plataforma\n"
+    echo -e "\t${grayColour}Token:${endColour} ${blueColour}HTB_TOKEN env var, ~/.config/htbExplorer/token o variable API_TOKEN${endColour}\n"
+    exit 1
+}
+
+# ---------- main ----------
+
+missing=(); for p in curl jq awk; do command -v "$p" >/dev/null 2>&1 || missing+=("$p"); done
+(( ${#missing[@]} )) && die "Faltan dependencias: ${missing[*]}  (pacman -S ${missing[*]} | apt install ${missing[*]})"
+
+parameter_counter=0
+while getopts ":e:s:i:u:r:c:w:d:k:x:a:v:f:h" arg; do
+    case $arg in
+        e) explorer_mode=$OPTARG;;
+        s) search_machine_name=$OPTARG;;
+        i) ip_address=$OPTARG;;
+        u) user_name=$OPTARG;;
+        r) reset_machineName=$OPTARG;;
+        d) machine_to_deploy=$OPTARG;;
+        k) machine_to_stop=$OPTARG;;
+        x) machine_to_extend=$OPTARG;;
+        f) send_flag=$OPTARG;;
+        v) download_vpn=$OPTARG;;
+        a) removed="-a (assign) ya no existe: usa -d para spawnear";;
+        c|w) removed="-$arg (shoutbox) fue eliminado de la plataforma";;
+        h|\?|:) helpPanel;;
+    esac
+    let parameter_counter+=1
+done
+(( parameter_counter == 0 )) && helpPanel
+[[ -n $removed ]] && die "$removed"
+
+[[ -z $API_TOKEN && -r $TOKEN_FILE ]] && API_TOKEN=$(<"$TOKEN_FILE")
+API_TOKEN=${API_TOKEN//[$'\r\n ']/}
+[[ -n $API_TOKEN ]] || die "Falta el App Token. Créalo en app.hackthebox.com/profile/settings y haz: export HTB_TOKEN='...'"
+
+[[ -n $search_machine_name ]] && { searchMachineName "$search_machine_name"; exit 0; }
+[[ -n $ip_address ]]          && { searchIPAddress "$ip_address"; exit 0; }
+[[ -n $user_name ]]           && { searchUserName "$user_name"; exit 0; }
+[[ -n $reset_machineName ]]   && { machineAction reset "$reset_machineName"; exit 0; }
+[[ -n $machine_to_deploy ]]   && { machineAction spawn "$machine_to_deploy"; exit 0; }
+[[ -n $machine_to_stop ]]     && { machineAction terminate "$machine_to_stop"; exit 0; }
+[[ -n $machine_to_extend ]]   && { machineAction extend "$machine_to_extend"; exit 0; }
+[[ -n $send_flag ]]           && { sendFlags "$send_flag"; exit 0; }
+[[ -n $download_vpn ]]        && { downloadVPN "$download_vpn"; exit 0; }
+[[ -n $explorer_mode ]]       && { exploreMode "$explorer_mode"; exit 0; }
+helpPanel
